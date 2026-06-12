@@ -73,7 +73,8 @@ Official code repository for the paper:
 ├── train.py                    # Standard softmax training
 ├── train_cac.py                # Training with CAC regularization
 ├── validate_github.py          # Closed-set validation
-├── test_cac_osr.py             # Open-set evaluation (8 metrics)
+├── test_cac_osr.py             # CAC OSR evaluation
+├── osr_metrics.py              # OSR metric functions (shared)
 ├── benchmark_jetson.py         # Jetson Orin NX edge deployment
 │
 └── checkpoint-261.pth.tar      # Pre-trained CAC + PlanktonNet
