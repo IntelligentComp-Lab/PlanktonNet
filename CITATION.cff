@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, cite the associated article."
+title: "PlanktonNet"
+version: 1.0.0
+authors: &paper_authors
+  - given-names: Yanting
+    family-names: Chen
+  - given-names: Lidong
+    family-names: Wang
+  - given-names: Bin
+    family-names: Zhou
+  - given-names: Kang
+    family-names: An
+  - given-names: Bei
+    family-names: Huang
+  - given-names: Hanyan
+    family-names: Luo
+  - given-names: Jieyu
+    family-names: Wang
+repository-code: "https://github.com/IntelligentComp-Lab/PlanktonNet"
+preferred-citation:
+  type: article
+  title: "PlanktonNet: A Three-Stage Hybrid Backbone for Fine-Grained Plankton Recognition"
+  authors: *paper_authors
+  journal: "Expert Systems with Applications"
+  year: 2026
+  doi: "10.1016/j.eswa.2026.135015"

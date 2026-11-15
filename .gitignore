@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/
+splits/
+weights/
+results/reference/
+results/new_run/
+jetson.csv
+figures/open_set/
+output/

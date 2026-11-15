@@ -13,10 +13,8 @@
 # limitations under the License.
 
 """
-PlanktonNet: A 3-stage UltraFormer for plankton image recognition.
-
-Based on the UltraFormer architecture with LeSRA_Adapter token mixers
-and SwiGLU MLPs. Adapted from timm.
+MetaFormer baselines.
+Implementations modified from timm (https://github.com/rwightman/pytorch-image-models).
 """
 from functools import partial
 import torch
@@ -38,7 +36,7 @@ def _cfg(url='', **kwargs):
 
 
 default_cfgs = {
-    'PlanktonNet': _cfg(url=''),
+    'twoSS2D': _cfg(url=''),
 }
 
 
@@ -67,8 +65,10 @@ class Conv2d_BN(torch.nn.Sequential):
         return m
 
 
-class MBConvDownSampling(torch.nn.Module):
-    """MBConv downsampling: 1x1 expand -> 3x3 DWConv stride-2 -> SE -> 1x1 project."""
+class PatchMerging(torch.nn.Module):
+    """
+    MobileMamba's inter-stage 2x downsampler.
+    """
 
     def __init__(self, dim, out_dim):
         super().__init__()
@@ -84,8 +84,11 @@ class MBConvDownSampling(torch.nn.Module):
         return x
 
 
-class PatchEmbedding(nn.Module):
-    """Patch embedding (stem): two 3x3 stride-2 convs + one 3x3 stride-1 conv (4x downsampling)."""
+class MobileMambaPatchEmbed(nn.Module):
+    """
+    MobileMamba's stem (patch embed) layer.
+    Replicates the 4x stride=2 convolutions.
+    """
 
     def __init__(self, in_channels, out_channels, **kwargs):
         super().__init__()
@@ -219,15 +222,11 @@ class MlpHead(nn.Module):
 
 
 # ==================================================================
-# LeSRA_Adapter: Locally-Enhanced Spatial Reduction Attention
+# [方案三] LeSRA_Adapter: 局部增强 SRA
 # ==================================================================
 class LeSRA_Adapter(nn.Module):
-    """Token mixer combining spatial-reduction attention (SRA) with a
-    parallel 3x3 depthwise convolution to recover local details.
-
-    SRA reduces K/V spatial resolution by reduction_ratio to lower the
-    quadratic cost of global self-attention. The DWConv branch compensates
-    for the fine-grained spatial information lost during reduction.
+    """
+    Local-Enhanced SRA: 在 Attention 之后并行一个 Depthwise Conv 来恢复局部细节
     """
 
     def __init__(self, dim, drop=0., num_heads=8, reduction_ratio=4, **kwargs):
@@ -241,7 +240,7 @@ class LeSRA_Adapter(nn.Module):
         self.q_proj = nn.Conv2d(dim, dim, 1)
         self.kv_proj = nn.Conv2d(dim, dim * 2, 1)
 
-        # Spatial reduction for K, V
+        # SRA 的下采样部分
         if self.r > 1:
             self.sr = nn.Conv2d(dim, dim, kernel_size=self.r, stride=self.r, groups=dim)
             self.sr_norm = nn.GroupNorm(1, dim)
@@ -249,7 +248,7 @@ class LeSRA_Adapter(nn.Module):
             self.sr = nn.Identity()
             self.sr_norm = nn.Identity()
 
-        # Local enhancement: 3x3 depthwise conv
+        # [NEW] 局部增强模块: 3x3 DWConv
         self.local_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
 
         self.out_proj = nn.Conv2d(dim, dim, 1)
@@ -272,33 +271,36 @@ class LeSRA_Adapter(nn.Module):
         kv = kv.reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
-        # 3. Global self-attention (SRA)
+        # 3. Attention (Global Context)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         out_attn = (attn @ v).transpose(1, 2).reshape(B, L, C)
         out_attn = out_attn.permute(0, 2, 1).reshape(B, C, H, W)
 
-        # 4. Local enhancement: DWConv on attention output
+        # 4. [NEW] Local Enhancement (Local Context)
+        # 将 Attention 的结果加上一个由 DWConv 提取的局部特征
+        # 注意：这里我们对 out_attn 再做一次局部卷积，或者直接对 x 做局部卷积并联
+        # 论文中常见做法是: Output = Proj( Attention(x) + LocalConv(x) ) 或者在 V 上做。
+        # 这里采用最稳健的后处理增强：
         out_local = self.local_conv(out_attn)
 
-        # Fuse global + local features
+        # 融合：全局 + 局部
         out = out_attn + out_local
 
         return self.out_proj(out)
 
 
-class UltraFormerBlock(nn.Module):
-    """UltraFormer block with four residual operations:
-        Op1: DWConv 7x7  — local spatial mixing
-        Op2: SimpleFFN   — lightweight channel mixing (pre-attention)
-        Op3: Global Mixer — LeSRA_Adapter (spatial-reduction attention)
-        Op4: MLP         — SwiGLU gated channel mixing
-
-    Each op follows: Norm -> Op -> DropPath -> LayerScale -> residual add.
+class MetaFormerBlock(nn.Module):
+    """
+    HybridFormerBlock:
+    op1: DWConv7x7 (residual)
+    op2: FFN_1 (residual)
+    op3: Token Mixer (residual)
+    op4: MLP (residual)
     """
 
     def __init__(self, dim,
-                 global_mixer=nn.Identity, mlp=Mlp,
+                 token_mixer=nn.Identity, mlp=Mlp,
                  drop=0., drop_path=0.,
                  layer_scale_init_value=1e-5, res_scale_init_value=None,
                  ffn1_mlp_ratio=2.0
@@ -323,7 +325,7 @@ class UltraFormerBlock(nn.Module):
             if res_scale_init_value else nn.Identity()
 
         self.norm1 = nn.GroupNorm(num_groups=1, num_channels=dim)
-        self.global_mixer = global_mixer(dim=dim, drop=drop)
+        self.token_mixer = token_mixer(dim=dim, drop=drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.layer_scale1 = Scale(dim=dim, init_value=layer_scale_init_value) \
             if layer_scale_init_value else nn.Identity()
@@ -354,7 +356,7 @@ class UltraFormerBlock(nn.Module):
         x = self.res_scale1(x) + \
             self.layer_scale1(
                 self.drop_path1(
-                    self.global_mixer(self.norm1(x))
+                    self.token_mixer(self.norm1(x))
                 )
             )
         x = self.res_scale2(x) + \
@@ -366,14 +368,13 @@ class UltraFormerBlock(nn.Module):
         return x
 
 
-class UltraFormer(nn.Module):
+class MetaFormer(nn.Module):
     def __init__(self, in_chans=3, num_classes=1000,
                  depths=[2, 2, 6, 2],
                  dims=[64, 128, 320, 512],
                  downsample_layers=None,
-                 global_mixers=nn.Identity,
+                 token_mixers=nn.Identity,
                  mlps=Mlp,
-                 drop_rate=0.,
                  drop_path_rate=0.,
                  head_dropout=0.0,
                  layer_scale_init_values=None,
@@ -400,8 +401,8 @@ class UltraFormer(nn.Module):
             [downsample_layers[i](down_dims[i], down_dims[i + 1]) for i in range(num_stage)]
         )
 
-        if not isinstance(global_mixers, (list, tuple)):
-            global_mixers = [global_mixers] * num_stage
+        if not isinstance(token_mixers, (list, tuple)):
+            token_mixers = [token_mixers] * num_stage
 
         if not isinstance(mlps, (list, tuple)):
             mlps = [mlps] * num_stage
@@ -418,10 +419,9 @@ class UltraFormer(nn.Module):
         cur = 0
         for i in range(num_stage):
             stage = nn.Sequential(
-                *[UltraFormerBlock(dim=dims[i],
-                                  global_mixer=global_mixers[i],
+                *[MetaFormerBlock(dim=dims[i],
+                                  token_mixer=token_mixers[i],
                                   mlp=mlps[i],
-                                  drop=drop_rate,
                                   drop_path=dp_rates[cur + j],
                                   layer_scale_init_value=layer_scale_init_values[i],
                                   res_scale_init_value=res_scale_init_values[i],
@@ -432,7 +432,7 @@ class UltraFormer(nn.Module):
 
         self.norm = output_norm(dims[-1])
 
-        # Classification head (not used for feature extraction)
+        # [修改]：保留 head 定义以防报错，但 Forward 不会用到它
         if head_dropout > 0.0:
             self.head = head_fn(dims[-1], num_classes, head_dropout=head_dropout)
         else:
@@ -457,40 +457,30 @@ class UltraFormer(nn.Module):
         return self.norm(x.mean([2, 3]))
 
     def forward(self, x):
-        # Return features only (no classification head); used for open-set recognition
+        # [修改]：只返回特征向量 (Batch, 448)，专为 ArcFace 设计
+        # 不要通过 self.head
         x = self.forward_features(x)
         return x
 
 
 @register_model
 def PlanktonNet(pretrained=False, **kwargs):
-    """PlanktonNet: 3-stage UltraFormer for plankton image recognition.
-
-    Architecture (see paper for details):
-        Stage 1: PatchEmbedding -> dim=200, depth=2     (4x downsampled)
-        Stage 2: MBConvDownSampling -> dim=376, depth=3  (8x downsampled)
-        Stage 3: MBConvDownSampling -> dim=448, depth=2  (16x downsampled)
-        Output:  GAP -> LayerNorm -> 448-dim feature vector
-
-    Token mixer: LeSRA_Adapter (SRA + local DWConv)
-    MLP: SwiGLU (SiLU-gated linear)
-    """
     DOWNSAMPLE_LAYERS_THREE_STAGES = [
-        partial(PatchEmbedding),
-        partial(MBConvDownSampling),
-        partial(MBConvDownSampling),
+        partial(MobileMambaPatchEmbed),
+        partial(PatchMerging),
+        partial(PatchMerging),
     ]
 
-    model = UltraFormer(
+    model = MetaFormer(
         depths=[2, 3, 2],
-        dims=[200, 376, 448],
+        dims=[200, 376, 448],  # 最后输出特征维度 448
         downsample_layers=DOWNSAMPLE_LAYERS_THREE_STAGES,
-        global_mixers=[LeSRA_Adapter, LeSRA_Adapter, LeSRA_Adapter],
+        token_mixers=[LeSRA_Adapter, LeSRA_Adapter, LeSRA_Adapter],
         mlps=MlpSwiGLU,
         head_fn=MlpHead,
         **kwargs)
 
-    model.default_cfg = default_cfgs['PlanktonNet']
+    model.default_cfg = default_cfgs['twoSS2D']
     return model
 
 

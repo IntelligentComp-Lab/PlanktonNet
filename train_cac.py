@@ -11,11 +11,10 @@ from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
-from torchmetrics.functional import pairwise_euclidean_distance
 
 # === Import Custom Modules ===
 from PlanktonNet import PlanktonNet
-from cacUtils import CACModel, CACLoss
+from cacUtils import CACModel, PaperCACLoss
 
 _logger = logging.getLogger('train_cac')
 
@@ -47,14 +46,14 @@ def parse_args():
     parser.add_argument('--cac-scale', default=0.1, type=float, help='Anchor loss weight')
 
     # Training Arguments
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=26)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--start-epoch', type=int, default=None)
     parser.add_argument('--log-interval', type=int, default=50)
 
     # Optimizer
-    parser.add_argument('--opt', default='sgd', type=str)
-    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--opt', type=str, default='adamw')
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--opt-eps', default=None, type=float)
@@ -117,6 +116,8 @@ def parse_args():
     parser.add_argument('--local_rank', default=0)
 
     args = parser.parse_args()
+    if any((args.mixup, args.cutmix, args.smoothing)):
+        parser.error('Paper CAC training requires hard labels. Use zero Mixup, CutMix, and smoothing.')
     return args
 
 
@@ -128,7 +129,7 @@ def main():
 
     # 1. Output setup
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    exp_name = args.experiment if args.experiment else 'cac_run'
+    exp_name = args.experiment or 'cac_paper'
     final_output_dir = os.path.join(args.output, f"{timestamp}_{exp_name}")
     os.makedirs(final_output_dir, exist_ok=True)
     add_file_handler(_logger, os.path.join(final_output_dir, 'train.log'))
@@ -145,14 +146,15 @@ def main():
     model.to(device)
 
     # 3. Loss & Opt
-    loss_fn = CACLoss(args.num_classes, magnitude=args.cac_magnitude, anchor_scale=args.cac_scale, device=device)
+    loss_fn = PaperCACLoss(args.num_classes, args.cac_magnitude, args.cac_scale).to(device)
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
     # AMP
     amp_autocast = suppress
     loss_scaler = None
     if args.amp:
-        from torch.cuda.amp import autocast, NativeScaler
+        from torch.cuda.amp import autocast
+        from timm.utils import NativeScaler
         amp_autocast = autocast
         loss_scaler = NativeScaler()
 
@@ -188,6 +190,7 @@ def main():
         mean=data_config['mean'],
         std=data_config['std'],
         num_workers=args.workers,
+        persistent_workers=args.workers > 0,
         device=device
     )
 
@@ -204,6 +207,7 @@ def main():
         mean=data_config['mean'],
         std=data_config['std'],
         num_workers=args.workers,
+        persistent_workers=args.workers > 0,
         device=device
     )
 
@@ -218,7 +222,7 @@ def main():
     )
 
     # 7. Loop
-    _logger.info(f"Start CAC Training ({args.epochs} epochs)...")
+    _logger.info(f"Start CAC training ({args.epochs} epochs).")
     total_start_time = time.time()
 
     for epoch in range(args.start_epoch or 0, args.epochs):
@@ -261,9 +265,8 @@ def main():
                 input, target = input.to(device), target.to(device)
                 output = model(input)
 
-                # CAC Logic: Argmin distance
-                dists = pairwise_euclidean_distance(output, loss_fn.centres)
-                acc = (dists.argmin(dim=1) == target).sum() / input.size(0)
+                prediction = output.argmax(dim=1)
+                acc = (prediction == target).sum() / input.size(0)
 
                 # Validation Loss
                 v_loss, _ = loss_fn(output, target)

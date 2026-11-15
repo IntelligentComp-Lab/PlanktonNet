@@ -39,7 +39,7 @@ import torch.nn as nn
 
 # Register PlanktonNet in timm registry before create_model is called
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from PlanktonNet import PlanktonNet  # noqa
+from closed_set_backbone import PlanktonNet_Le as PlanktonNet  # noqa
 
 from timm.models import create_model, load_checkpoint
 from timm.data import create_dataset, create_loader, resolve_data_config
@@ -337,6 +337,7 @@ def measure_accuracy(model, data_dir, num_classes, img_size, batch_size, device,
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=workers,
+            persistent_workers=workers > 0,
             crop_pct=data_config.get('crop_pct', 1.0),
             pin_memory=True,
             device=device,
@@ -420,7 +421,7 @@ def benchmark_one_model(args):
 
     # ---- Build model -------------------------------------------------------
     model = create_model(
-        args.model,
+        ("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
         pretrained=False,
         num_classes=args.num_classes,
     )
