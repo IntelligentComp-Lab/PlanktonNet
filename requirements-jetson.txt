@@ -1,3 +1,0 @@
-# Install NVIDIA's PyTorch and compatible TorchVision for your JetPack first.
-timm==1.0.22
-scikit-learn==1.6.1

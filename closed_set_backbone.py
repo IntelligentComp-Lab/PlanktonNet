@@ -12,22 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from functools import partial
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from timm.layers import trunc_normal_, DropPath, SqueezeExcite
 from timm.models import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
-# 尝试导入 torchvision 用于可变形卷积，如果没有安装则会报错
-try:
-    from torchvision.ops import deform_conv2d
-except ImportError:
-    print("Warning: torchvision not found. PlanktonNet_D (Deformable) will not work.")
-
 
 def _cfg(url='', **kwargs):
     return {
@@ -175,149 +166,6 @@ class MlpHead(nn.Module):
 
 
 # ==================================================================
-# [方案一] MS_SRA_Adapter: 多尺度 SRA
-# ==================================================================
-class MS_SRA_Adapter(nn.Module):
-    """
-    Multi-Scale SRA: 使用两个不同 stride 的下采样分支来捕获不同尺度的特征
-    """
-
-    def __init__(self, dim, drop=0., num_heads=8, reduction_ratio=4, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.r = reduction_ratio
-
-        self.q_proj = nn.Conv2d(dim, dim, 1)
-
-        # KV 投影 (输入维度是 dim, 输出是 dim*2)
-        # 注意：这里 KV 先在 token 层面拼接，所以 Linear 层的输入 dim 不变，但处理的 token 数变多了
-        self.kv_proj = nn.Linear(dim, dim * 2)
-
-        # 两个尺度的下采样
-        if self.r > 1:
-            # 分支1: 标准 stride = r
-            self.sr1 = nn.Conv2d(dim, dim, kernel_size=self.r, stride=self.r, groups=dim)
-            self.norm1 = nn.GroupNorm(1, dim)
-
-            # 分支2: 精细 stride = r/2 (如果 r>=2)
-            r2 = max(1, self.r // 2)
-            self.sr2 = nn.Conv2d(dim, dim, kernel_size=r2, stride=r2, groups=dim)
-            self.norm2 = nn.GroupNorm(1, dim)
-        else:
-            self.sr1 = nn.Identity()
-            self.norm1 = nn.Identity()
-            self.sr2 = nn.Identity()
-            self.norm2 = nn.Identity()
-
-        self.out_proj = nn.Conv2d(dim, dim, 1)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        L = H * W
-
-        # 1. Q (保持全分辨率)
-        q = self.q_proj(x).flatten(2).transpose(1, 2)  # (B, L, C)
-        q = q.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, L, C_head)
-
-        # 2. 多尺度下采样生成 K, V
-        if self.r > 1:
-            # 路径 1
-            x1 = self.norm1(self.sr1(x)).flatten(2).transpose(1, 2)  # (B, L1, C)
-            # 路径 2
-            x2 = self.norm2(self.sr2(x)).flatten(2).transpose(1, 2)  # (B, L2, C)
-            # 拼接 tokens
-            x_cat = torch.cat([x1, x2], dim=1)  # (B, L1+L2, C)
-        else:
-            x_cat = self.norm1(x).flatten(2).transpose(1, 2)
-
-        # 3. 生成 K, V
-        kv = self.kv_proj(x_cat)  # (B, L_all, 2*C)
-        kv = kv.reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]  # (B, H, L_all, C_head)
-
-        # 4. Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-
-        out = (attn @ v).transpose(1, 2).reshape(B, L, C)  # (B, L, C)
-        out = out.permute(0, 2, 1).reshape(B, C, H, W)
-
-        return self.out_proj(out)
-
-
-# ==================================================================
-# [方案二] D_SRA_Adapter: 可变形 SRA (修复版)
-# ==================================================================
-class D_SRA_Adapter(nn.Module):
-    """
-    Deformable SRA: 使用可变形卷积动态采样 Key 和 Value
-    """
-
-    def __init__(self, dim, drop=0., num_heads=8, reduction_ratio=4, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.r = reduction_ratio
-
-        self.q_proj = nn.Conv2d(dim, dim, 1)
-        self.kv_proj = nn.Conv2d(dim, dim * 2, 1)
-        self.out_proj = nn.Conv2d(dim, dim, 1)
-
-        if self.r > 1:
-            # 偏移量生成器
-            # kernel_size=r 对应 stride=r
-            # offset channel = 2 * offset_groups * kernel_h * kernel_w
-            # 这里 offset_groups=1 (所有通道共享同一套变形), 所以是 2 * r * r
-            self.offset_conv = nn.Conv2d(dim, 2 * self.r * self.r, kernel_size=self.r, stride=self.r, padding=0)
-            self.sr_norm = nn.GroupNorm(1, dim)
-        else:
-            self.sr_norm = nn.Identity()
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        L = H * W
-
-        # 1. Q
-        q = self.q_proj(x).flatten(2).transpose(1, 2)
-        q = q.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        # 2. Deformable Sampling for K, V
-        if self.r > 1:
-            # 生成偏移量
-            offsets = self.offset_conv(x)
-
-            # 构造 depthwise 的 weight (类似 Average Pooling)
-            # 形状: (out_channels, in_channels/groups, k, k) -> (C, 1, r, r)
-            # deform_conv2d 会自动推断 groups = C
-            weight = torch.ones(C, 1, self.r, self.r, device=x.device) / (self.r * self.r)
-
-            # [FIXED] 移除了 groups=C 参数
-            x_down = deform_conv2d(x, offsets, weight, stride=self.r, padding=0)
-
-            x_down = self.sr_norm(x_down)
-        else:
-            x_down = self.sr_norm(x)
-
-        # 3. K, V 生成
-        kv = self.kv_proj(x_down).flatten(2).transpose(1, 2)
-        kv = kv.reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-
-        # 4. Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, L, C)
-        out = out.permute(0, 2, 1).reshape(B, C, H, W)
-
-        return self.out_proj(out)
-
-
-# ==================================================================
 # [方案三] LeSRA_Adapter: 局部增强 SRA
 # ==================================================================
 class LeSRA_Adapter(nn.Module):
@@ -384,66 +232,6 @@ class LeSRA_Adapter(nn.Module):
         out = out_attn + out_local
 
         return self.out_proj(out)
-
-
-# ==================================================================
-# [方案三] LeSRA_Adapter: 局部增强 SRA
-# ==================================================================
-class SRA_Adapter(nn.Module):
-    """
-    Local-Enhanced SRA: 在 Attention 之后并行一个 Depthwise Conv 来恢复局部细节
-    """
-
-    def __init__(self, dim, drop=0., num_heads=8, reduction_ratio=4, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.r = reduction_ratio
-
-        self.q_proj = nn.Conv2d(dim, dim, 1)
-        self.kv_proj = nn.Conv2d(dim, dim * 2, 1)
-
-        # SRA 的下采样部分
-        if self.r > 1:
-            self.sr = nn.Conv2d(dim, dim, kernel_size=self.r, stride=self.r, groups=dim)
-            self.sr_norm = nn.GroupNorm(1, dim)
-        else:
-            self.sr = nn.Identity()
-            self.sr_norm = nn.Identity()
-
-        # [NEW] 局部增强模块: 3x3 DWConv
-        self.local_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
-
-        self.out_proj = nn.Conv2d(dim, dim, 1)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        L = H * W
-
-        # 1. Q
-        q = self.q_proj(x).flatten(2).transpose(1, 2)
-        q = q.reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        # 2. K, V
-        if self.r > 1:
-            x_down = self.sr_norm(self.sr(x))
-        else:
-            x_down = self.sr_norm(x)
-
-        kv = self.kv_proj(x_down).flatten(2).transpose(1, 2)
-        kv = kv.reshape(B, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-
-        # 3. Attention (Global Context)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out_attn = (attn @ v).transpose(1, 2).reshape(B, L, C)
-        out_attn = out_attn.permute(0, 2, 1).reshape(B, C, H, W)
-
-
-        return self.out_proj(out_attn)
 
 
 # ==================================================================
@@ -550,7 +338,7 @@ class MetaFormer(nn.Module):
 
 
 # ==================================================================
-# 注册三个模型 (Three Models)
+# Register the PlanktonNet classifier
 # ==================================================================
 
 DOWNSAMPLE_LAYERS_THREE_STAGES = [
@@ -560,36 +348,7 @@ DOWNSAMPLE_LAYERS_THREE_STAGES = [
 ]
 
 
-# 1. 方案一：PlanktonNet_MS (Multi-Scale)
-@register_model
-def PlanktonNet_MS(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[2, 3, 2],
-        dims=[200, 376, 448],
-        downsample_layers=DOWNSAMPLE_LAYERS_THREE_STAGES,
-        token_mixers=[MS_SRA_Adapter, MS_SRA_Adapter, MS_SRA_Adapter],  # 使用 MS-SRA
-        mlps=MlpSwiGLU,
-        head_fn=MlpHead,
-        **kwargs)
-    model.default_cfg = default_cfgs['twoSS2D']
-    return model
-
-
-# 2. 方案二：PlanktonNet_D (Deformable)
-@register_model
-def PlanktonNet_D(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[2, 3, 2],
-        dims=[200, 376, 448],
-        downsample_layers=DOWNSAMPLE_LAYERS_THREE_STAGES,
-        token_mixers=[D_SRA_Adapter, D_SRA_Adapter, D_SRA_Adapter],  # 使用 D-SRA
-        mlps=MlpSwiGLU,
-        head_fn=MlpHead,
-        **kwargs)
-    model.default_cfg = default_cfgs['twoSS2D']
-    return model
-
-# 3. 方案三：PlanktonNet_Le (Local-Enhanced)
+# The paper model with a classification head
 @register_model
 def PlanktonNet_Le(pretrained=False, **kwargs):
     model = MetaFormer(
@@ -597,20 +356,6 @@ def PlanktonNet_Le(pretrained=False, **kwargs):
         dims=[200, 376, 448],
         downsample_layers=DOWNSAMPLE_LAYERS_THREE_STAGES,
         token_mixers=[LeSRA_Adapter, LeSRA_Adapter, LeSRA_Adapter],  # 使用 LeSRA
-        mlps=MlpSwiGLU,
-        head_fn=MlpHead,
-        **kwargs)
-    model.default_cfg = default_cfgs['twoSS2D']
-    return model
-
-
-@register_model
-def PlanktonNet_SRA(pretrained=False, **kwargs):
-    model = MetaFormer(
-        depths=[2, 3, 2],
-        dims=[200, 376, 448],
-        downsample_layers=DOWNSAMPLE_LAYERS_THREE_STAGES,
-        token_mixers=[SRA_Adapter, SRA_Adapter, SRA_Adapter],  # 使用 LeSRA
         mlps=MlpSwiGLU,
         head_fn=MlpHead,
         **kwargs)

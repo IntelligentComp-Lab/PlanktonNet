@@ -22,9 +22,9 @@ ARCHIVED_CHECKPOINT_SHA256 = "ff076aa7d9344cc5926f7696fa008123fa6024348dfeb21d34
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--backbone-source", type=Path, required=True)
+    p.add_argument("--backbone-source", type=Path, default=REVISION_ROOT / "PlanktonNet.py")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--data-dir", type=Path, default=REVISION_ROOT / "data")
     p.add_argument("--dataset", default="ZooplanktonBench50_OpenSet")
