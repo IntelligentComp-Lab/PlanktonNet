@@ -1,14 +1,7 @@
-"""
-Shared OSR metrics module.
-Provides standard OSR metrics (AUROC, AUPR, FPR95) plus paper-defined metrics.
+"""Metrics and rejection-threshold selection for open-set recognition.
 
-Binary label convention:
-    known samples → label 0 (negative/known)
-    unknown samples → label 1 (positive/unknown)
-
-Score convention:
-    Higher score → more likely to be unknown (anomaly).
-    Callers must ensure score direction matches this convention.
+Detection metrics label known samples as 0 and unknown samples as 1.
+Higher scores indicate a greater likelihood of being unknown.
 """
 
 import numpy as np
@@ -16,6 +9,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
 
 def compute_standard_metrics(scores_known, scores_unknown):
+    """Compute AUROC, average precision, and the FPR at the first TPR of at least 0.95."""
     y_true = np.concatenate([
         np.zeros(len(scores_known), dtype=int),
         np.ones(len(scores_unknown), dtype=int),
@@ -32,6 +26,7 @@ def compute_standard_metrics(scores_known, scores_unknown):
 
 
 def compute_paper_metrics(score_k, pred_k, label_k, score_u, threshold):
+    """Compute the paper's metrics, rejecting samples whose score exceeds the threshold."""
     import torch
     correct_k_closed = (pred_k == label_k)
     acc_known_closed = float(correct_k_closed.float().mean())
@@ -55,6 +50,12 @@ def compute_paper_metrics(score_k, pred_k, label_k, score_u, threshold):
 
 
 def search_best_threshold(score_k, pred_k, label_k, score_u, n_steps=2000):
+    """Find the threshold with the highest open-set F1 on the given scores.
+
+    Search observed scores unless their count exceeds n_steps. In that case,
+    search an evenly spaced grid. Passing None always searches observed scores.
+    Ties keep the lowest candidate threshold.
+    """
     import torch
     score_k_np = np.asarray(score_k)
     score_u_np = np.asarray(score_u)
@@ -77,6 +78,7 @@ def search_best_threshold(score_k, pred_k, label_k, score_u, n_steps=2000):
 
 
 def compute_tau_curve(score_k, pred_k, label_k, score_u, n_steps=500):
+    """Compute the paper's metrics over an evenly spaced threshold grid."""
     import torch
     score_k_np = np.asarray(score_k)
     score_u_np = np.asarray(score_u)

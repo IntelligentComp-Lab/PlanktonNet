@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
-"""
-Jetson Orin NX Deployment Benchmark
+"""Benchmark PlanktonNet on the NVIDIA Jetson Orin NX.
 
-Measures per-model efficiency metrics:
-  - Params (M), FLOPs (G), Model Size (MB)
-  - Top-1 / Top-5 Accuracy (%)  [when --data-dir provided]
-  - Inference Latency FP32 / FP16 (ms ± std, batch=1)
-  - Batch Latency (ms/batch) at each throughput batch size
-  - Throughput FP32 / FP16 (imgs/s, multiple batch sizes)
-  - Peak GPU Memory FP32 / FP16 (MB)
-  - Average Power Consumption FP32 / FP16 (mW)
-  - Energy Efficiency (imgs/s/W)
+Reports parameter count, GFLOPs when a counter is available, and checkpoint
+file size in MiB. Warmed-up CUDA-event measurements cover model inference on
+device-resident inputs in FP32 and with FP16 autocast. The benchmark reports
+single-image latency, batch throughput and latency, and peak allocated GPU
+memory. Power and energy-efficiency metrics require supported Jetson sensors.
 
-Usage:
-  cd code/edgeDeployment
-  python benchmark_jetson.py --model PlanktonNet \
-      --checkpoint ../../model_weight/20251206-225338-PlanktonNet_Le-224/model_best.pth.tar \
-      --num-classes 50 --img-size 224 --output results.csv
+Run from the repository root.
+    python benchmark_jetson.py --model PlanktonNet --checkpoint weights/closed_zooplanktonbench50.pth --num-classes 50 --img-size 224 --output jetson.csv
 
-Accuracy measurement (requires dataset):
-  python benchmark_jetson.py --model PlanktonNet \
-      --checkpoint .../model_best.pth.tar \
-      --data-dir ../../data/ZooplanktonBench50_test --num-classes 50
+Add --data-dir data/ZooplanktonBench50/test to also evaluate classification accuracy.
 """
 
 import argparse
@@ -37,9 +26,9 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
-# Register PlanktonNet in timm registry before create_model is called
+# Import PlanktonNet so its classifier is registered before timm.create_model runs.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
-from closed_set_backbone import PlanktonNet_Le as PlanktonNet  # noqa
+from PlanktonNet import PlanktonNet_Le as PlanktonNet  # noqa
 
 from timm.models import create_model, load_checkpoint
 from timm.data import create_dataset, create_loader, resolve_data_config
@@ -73,10 +62,7 @@ def _has_fvcore():
 
 
 def measure_flops(model, input_tensor):
-    """
-    Measure GFLOPs.
-    Priority: torch.utils.flop_counter -> thop -> fvcore -> None
-    """
+    """Estimate GFLOPs with the first compatible counter, or return None."""
     if _has_flop_counter_mode():
         from torch.utils.flop_counter import FlopCounterMode
         try:
@@ -166,7 +152,7 @@ class JetsonPowerMonitor:
 # ---------------------------------------------------------------------------
 
 def measure_latency(model, input_tensor, amp_dtype=None, warmup=30, runs=200):
-    """Average single-image inference latency (ms) and standard deviation."""
+    """Return the mean and standard deviation of warmed-up CUDA-event latency in ms."""
     model.eval()
     with torch.no_grad():
         for _ in range(warmup):
@@ -201,7 +187,7 @@ def measure_latency(model, input_tensor, amp_dtype=None, warmup=30, runs=200):
 
 def measure_throughput_and_memory(model, input_tensor, batch_size, amp_dtype=None,
                                   warmup=10, runs=50):
-    """Returns (throughput_imgs_per_sec, peak_gpu_memory_MB, batch_latency_ms)."""
+    """Return images per second, peak allocated memory in MiB, and ms per batch."""
     batch = input_tensor.repeat(batch_size, 1, 1, 1)
 
     torch.cuda.empty_cache()
@@ -242,7 +228,7 @@ def measure_throughput_and_memory(model, input_tensor, batch_size, amp_dtype=Non
 
 def measure_power_during_inference(model, input_tensor, batch_size, amp_dtype=None,
                                    duration_s=5):
-    """Run sustained inference while sampling power; return avg power in mW."""
+    """Return mean measured and idle-adjusted inference power in mW."""
     pm = JetsonPowerMonitor()
     if not pm.sensors:
         return None, None
@@ -291,10 +277,7 @@ def _measure_idle_power(pm, duration_s=3):
 
 def measure_accuracy(model, data_dir, num_classes, img_size, batch_size, device,
                      amp_dtype=None, metrics_avg='macro', workers=4):
-    """
-    Measure Top-1, Top-5 accuracy and optionally precision/recall/F1.
-    Returns dict with accuracy metrics, or empty dict on failure.
-    """
+    """Evaluate top-1 and top-5 accuracy and optionally precision, recall, and F1."""
     try:
         from timm.utils import accuracy, AverageMeter
     except ImportError:
@@ -303,8 +286,7 @@ def measure_accuracy(model, data_dir, num_classes, img_size, batch_size, device,
 
     model.eval()
 
-    # Resolve data config — let model default_cfg supply mean/std/crop_pct
-    # (models like tf_efficientnetv2 use (0.5,0.5,0.5) and mobilevit uses (0,0,0)/(1,1,1))
+    # Use the model defaults for normalization and cropping at the requested image size.
     data_config = resolve_data_config(
         {'input_size': (3, img_size, img_size)},
         model=model,
@@ -318,7 +300,7 @@ def measure_accuracy(model, data_dir, num_classes, img_size, batch_size, device,
         try:
             dataset = create_dataset(root=data_dir, name='', split='test')
         except Exception:
-            # Try with explicit folder structure (ImageFolder default)
+            # Fall back to a directory with one subdirectory per class.
             from torchvision.datasets import ImageFolder
             from torch.utils.data import DataLoader
             try:
@@ -370,7 +352,7 @@ def measure_accuracy(model, data_dir, num_classes, img_size, batch_size, device,
     with torch.inference_mode():
         for input, target in loader:
             if use_timm_loader:
-                pass  # timm loader already puts data on device
+                pass  # The timm loader already moves batches to the target device.
             else:
                 input = input.to(device=device)
                 target = target.to(device=device)
@@ -433,6 +415,7 @@ def benchmark_one_model(args):
 
     # ---- Static metrics ----------------------------------------------------
     params_m = round(sum(p.numel() for p in model.parameters()) / 1e6, 2)
+    # Report the on-disk checkpoint size in MiB.
     model_size_mb = round(os.path.getsize(args.checkpoint) / (1024 * 1024), 2)
     flops_g = measure_flops(model, input_tensor)
 
@@ -537,10 +520,10 @@ def benchmark_one_model(args):
         result[f'tp_fp16_bs{bs}'] = tp_results[(bs, 'fp16')]
         result[f'lat_fp32_bs{bs}_ms'] = bl_results[(bs, 'fp32')]
         result[f'lat_fp16_bs{bs}_ms'] = bl_results[(bs, 'fp16')]
-    # Memory at max batch
+    # Record peak allocated memory at the largest requested batch size.
     result[f'mem_fp32_bs{max_bs}_MB'] = mem_results[(max_bs, 'fp32')]
     result[f'mem_fp16_bs{max_bs}_MB'] = mem_results[(max_bs, 'fp16')]
-    # Power
+    # Record idle-adjusted power when sensor readings are available.
     result['power_fp32_mW'] = pow_fp32_net
     result['power_fp16_mW'] = pow_fp16_net
     # Energy efficiency

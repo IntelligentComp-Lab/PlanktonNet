@@ -1,3 +1,5 @@
+"""Data loading, checkpoint validation, and scoring for open-set evaluation."""
+
 import hashlib
 import importlib.util
 from pathlib import Path
@@ -58,6 +60,7 @@ def get_class_map(dataset) -> dict[str, int]:
 
 
 def check_unknown_classes(class_map, validation_dataset, test_dataset):
+    """Require disjoint known, unknown validation, and unknown test classes."""
     validation = set(get_class_map(validation_dataset))
     test = set(get_class_map(test_dataset))
     overlap = (validation & test) | ((validation | test) & set(class_map))
@@ -66,12 +69,14 @@ def check_unknown_classes(class_map, validation_dataset, test_dataset):
 
 
 def training_class_centers(features, targets):
+    """Return the mean training embedding for each known class, ordered by label."""
     class_ids = targets.unique(sorted=True)
     centers = torch.stack([features[targets == label].mean(dim=0) for label in class_ids])
     return class_ids, centers
 
 
 def score_cac_features(features, centers, class_ids):
+    """Return the Euclidean distance and class label of the nearest training center."""
     distances = torch.cdist(features.float(), centers.float(), p=2)
     scores, nearest = distances.min(dim=1)
     return scores, class_ids[nearest]
@@ -85,7 +90,7 @@ def check_new_result_path(path):
 
 
 def create_exact_planktonnet(backbone_source: Path):
-    """Load an explicitly selected, checkpoint-audited PlanktonNet source."""
+    """Instantiate the PlanktonNet backbone from the specified Python file."""
     source_hash = hashlib.sha256(str(backbone_source.resolve()).encode("utf-8")).hexdigest()[:12]
     module_name = f"cac_exact_checkpoint_planktonnet_{source_hash}"
     spec = importlib.util.spec_from_file_location(module_name, backbone_source)
@@ -100,6 +105,7 @@ def create_exact_planktonnet(backbone_source: Path):
 def load_model(
     checkpoint: Path, backbone_source: Path, device: torch.device
 ) -> CACModel:
+    """Load a CAC checkpoint and require every model parameter and buffer to match."""
     backbone = create_exact_planktonnet(backbone_source)
     checkpoint_object = torch.load(checkpoint, map_location="cpu", weights_only=False)
     state_dict = checkpoint_object.get("state_dict", checkpoint_object)
@@ -125,6 +131,7 @@ def extract_features(
     description: str,
     feature_space: str = "backbone",
 ):
+    """Collect backbone embeddings or CAC logits and labels on the CPU."""
     feature_batches: list[torch.Tensor] = []
     label_batches: list[torch.Tensor] = []
     for inputs, targets in tqdm(loader, desc=description):
@@ -147,6 +154,7 @@ def metrics_for_validation(
     *,
     n_steps: int | None = 2000,
 ) -> dict[str, Any]:
+    """Select the rejection threshold that maximizes open-set F1 on validation data."""
     threshold, paper_tuple = search_best_threshold(
         known_scores, known_predictions, known_targets, unknown_scores, n_steps=n_steps
     )
