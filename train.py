@@ -42,7 +42,7 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
-from PlanktonNet import PlanktonNet
+from closed_set_backbone import PlanktonNet_Le as PlanktonNet
 
 
 try:
@@ -486,7 +486,7 @@ def main():
         )
 
     model = create_model(
-        args.model,
+        ("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
         pretrained=args.pretrained,
         in_chans=in_chans,
         num_classes=args.num_classes,
@@ -745,6 +745,7 @@ def main():
         mean=data_config['mean'],
         std=data_config['std'],
         num_workers=args.workers,
+        persistent_workers=args.workers > 0,
         distributed=args.distributed,
         collate_fn=collate_fn,
         pin_memory=args.pin_mem,
@@ -770,6 +771,7 @@ def main():
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=eval_workers,
+            persistent_workers=eval_workers > 0,
             distributed=args.distributed,
             crop_pct=data_config['crop_pct'],
             pin_memory=args.pin_mem,
@@ -897,6 +899,7 @@ def main():
                 optimizer,
                 train_loss_fn,
                 args,
+                device=device,
                 lr_scheduler=lr_scheduler,
                 saver=saver,
                 output_dir=output_dir,

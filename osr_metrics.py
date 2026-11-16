@@ -3,8 +3,8 @@ Shared OSR metrics module.
 Provides standard OSR metrics (AUROC, AUPR, FPR95) plus paper-defined metrics.
 
 Binary label convention:
-    known samples → label 0 (positive/normal)
-    unknown samples → label 1 (negative/anomaly)
+    known samples → label 0 (negative/known)
+    unknown samples → label 1 (positive/unknown)
 
 Score convention:
     Higher score → more likely to be unknown (anomaly).
@@ -60,7 +60,7 @@ def search_best_threshold(score_k, pred_k, label_k, score_u, n_steps=2000):
     score_u_np = np.asarray(score_u)
     all_scores = np.concatenate([score_k_np, score_u_np])
     thresholds = np.unique(all_scores)
-    if len(thresholds) > n_steps:
+    if n_steps is not None and len(thresholds) > n_steps:
         thresholds = np.linspace(all_scores.min(), all_scores.max(), n_steps)
     best_f = -1.0
     best_th = 0.0

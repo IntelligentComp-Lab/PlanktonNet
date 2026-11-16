@@ -28,7 +28,7 @@ from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
 
-from PlanktonNet import PlanktonNet
+from closed_set_backbone import PlanktonNet_Le as PlanktonNet
 
 
 
@@ -234,7 +234,7 @@ def validate(args):
         in_chans = args.input_size[0]
 
     model = create_model(
-        args.model,
+        ("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
         pretrained=args.pretrained,
         num_classes=args.num_classes,
         in_chans=in_chans,
@@ -253,7 +253,7 @@ def validate(args):
         model = reparameterize_model(model)
 
     param_count = sum([m.numel() for m in model.parameters()])
-    _logger.info('Model %s created, param count: %d' % (args.model, param_count))
+    _logger.info('Model %s created, param count: %d' % (("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model), param_count))
 
     data_config = resolve_data_config(
         vars(args),
@@ -333,6 +333,7 @@ def validate(args):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
+            persistent_workers=args.workers > 0,
             crop_pct=crop_pct,
             crop_mode=data_config['crop_mode'],
             crop_border_pixels=args.crop_border_pixels,
@@ -352,6 +353,7 @@ def validate(args):
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
+            persistent_workers=args.workers > 0,
             crop_pct=crop_pct,
             crop_mode=data_config['crop_mode'],
             crop_border_pixels=args.crop_border_pixels,
@@ -453,7 +455,7 @@ def validate(args):
         print(metric_results)
 
     results = OrderedDict(
-        model=args.model,
+        model=("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
         top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
         top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
         **metric_results,
@@ -516,7 +518,7 @@ def main():
         checkpoints = glob.glob(args.checkpoint + '/*.pth.tar')
         checkpoints += glob.glob(args.checkpoint + '/*.pth')
         model_names = list_models(args.model)
-        model_cfgs = [(args.model, c) for c in sorted(checkpoints, key=natural_key)]
+        model_cfgs = [(("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model), c) for c in sorted(checkpoints, key=natural_key)]
     else:
         if args.model == 'all':
             # validate all models in a list of names with pretrained checkpoints
@@ -529,7 +531,7 @@ def main():
         elif not is_model(args.model):
             # model name doesn't exist, try as wildcard filter
             model_names = list_models(
-                args.model,
+                ("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
                 pretrained=True,
             )
             model_cfgs = [(n, '') for n in model_names]
