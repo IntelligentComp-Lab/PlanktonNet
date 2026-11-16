@@ -61,6 +61,17 @@ Test with the checkpoint from CAC training. The evaluator estimates class center
 python eval_cac_planktonnet.py --data-dir data --dataset ZooplanktonBench50_OpenSet --checkpoint path/to/cac-checkpoint.pth.tar --output results/cac_planktonnet.json --batch-size 32 --workers 0 --device cpu
 ```
 
+## Jetson Orin NX benchmark
+
+Install the PyTorch and TorchVision builds for your JetPack version, then install the benchmark dependencies. Use a checkpoint from PlanktonNet classification training.
+
+```sh
+python -m pip install -r requirements-jetson.txt
+python benchmark_jetson.py --model PlanktonNet --checkpoint path/to/closed-set-checkpoint.pth.tar --num-classes 50 --data-dir data/ZooplanktonBench50/test --workers 0 --batch-sizes 1 8 16 32 64 --output jetson.csv
+```
+
+The benchmark measures inference latency, throughput, and peak GPU memory in FP32 and FP16. The example also evaluates accuracy on the test split.
+
 ## Citation
 
 If you use the code, cite the paper using [the article DOI](https://doi.org/10.1016/j.eswa.2026.135015). See [CITATION.cff](CITATION.cff) and [the code license](LICENSE).
