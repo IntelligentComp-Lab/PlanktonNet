@@ -27,11 +27,11 @@ def add_file_handler(logger, log_file):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='PyTorch CAC Training')
+    parser = argparse.ArgumentParser(description='Train PlanktonNet with CAC')
 
     # Path Arguments
     parser.add_argument('--data-dir', metavar='DIR', required=True)
-    parser.add_argument('--dataset', default='ImageFolder')
+    parser.add_argument('--dataset', default='ZooplanktonBench50_OpenSet')
     parser.add_argument('--output', default='./output/train_cac', type=str)
     parser.add_argument('--experiment', default='', type=str)
     parser.add_argument('--workers', type=int, default=4)
@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('--device', default='cuda', type=str)
 
     # Model & CAC Arguments
-    parser.add_argument('--model', default='plankton_net', type=str)
+    parser.add_argument('--model', default='plankton_net', choices=('plankton_net',))
     parser.add_argument('--num-classes', type=int, default=50)
     parser.add_argument('--feature-dim', default=448, type=int)
     parser.add_argument('--cac-magnitude', default=10.0, type=float, help='Anchor magnitude')

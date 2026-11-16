@@ -79,8 +79,8 @@ parser.add_argument('--target-key', default=None, type=str,
 parser.add_argument('--dataset-trust-remote-code', action='store_true', default=False,
                    help='Allow huggingface dataset import to execute code downloaded from the dataset\'s repo.')
 
-parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
-                    help='model architecture (default: dpn92)')
+parser.add_argument('--model', '-m', metavar='NAME', default='PlanktonNet',
+                    help='closed-set model architecture (default: PlanktonNet)')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -511,14 +511,15 @@ _NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer'
 def main():
     setup_default_logging()
     args = parser.parse_args()
+    model_name = "PlanktonNet_Le" if args.model == "PlanktonNet" else args.model
     model_cfgs = []
     model_names = []
     if os.path.isdir(args.checkpoint):
         # validate all checkpoints in a path with same model
         checkpoints = glob.glob(args.checkpoint + '/*.pth.tar')
         checkpoints += glob.glob(args.checkpoint + '/*.pth')
-        model_names = list_models(args.model)
-        model_cfgs = [(("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model), c) for c in sorted(checkpoints, key=natural_key)]
+        model_names = list_models(model_name)
+        model_cfgs = [(model_name, c) for c in sorted(checkpoints, key=natural_key)]
     else:
         if args.model == 'all':
             # validate all models in a list of names with pretrained checkpoints
@@ -528,11 +529,10 @@ def main():
                 exclude_filters=_NON_IN1K_FILTERS,
             )
             model_cfgs = [(n, '') for n in model_names]
-        elif not is_model(args.model):
+        elif not is_model(model_name):
             # model name doesn't exist, try as wildcard filter
             model_names = list_models(
-                ("PlanktonNet_Le" if args.model == "PlanktonNet" else args.model),
-                pretrained=True,
+                model_name, pretrained=True,
             )
             model_cfgs = [(n, '') for n in model_names]
 
