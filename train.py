@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-""" ImageNet Training Script
+"""Train the closed-set PlanktonNet classifier.
 
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
+Supports checkpoint resumption, mixed precision, distributed training, and
+validation during training. Command-line options override YAML configuration
+defaults supplied with --config.
 
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
+Adapted from the PyTorch ImageNet example
+(https://github.com/pytorch/examples/tree/master/imagenet), with CUDA
+optimizations from NVIDIA Apex
+(https://github.com/NVIDIA/apex/tree/master/examples/imagenet).
 
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
+Copyright 2020 Ross Wightman (https://github.com/rwightman).
 """
 import os
 os.environ["USE_LIBUV"] = "0"
@@ -42,7 +40,7 @@ from timm.models import create_model, safe_model_name, resume_checkpoint, load_c
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
-from closed_set_backbone import PlanktonNet_Le as PlanktonNet
+from PlanktonNet import PlanktonNet_Le as PlanktonNet
 
 
 try:
@@ -72,8 +70,7 @@ has_compile = hasattr(torch, 'compile')
 
 _logger = logging.getLogger('train')
 
-# The first arg parser parses out only the --config argument, this argument is used to
-# load a yaml file containing key-values that override the defaults for the main parser below
+# Parse --config first to apply YAML defaults before parsing the remaining options.
 config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
 parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
                     help='YAML config file specifying default arguments')
@@ -165,14 +162,14 @@ group.add_argument('--head-init-bias', default=None, type=float,
 group.add_argument('--torchcompile-mode', type=str, default=None,
                     help="torch.compile mode (default: None).")
 
-# scripting / codegen
+# Compilation and scripting options
 scripting_group = group.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', dest='torchscript', action='store_true',
                              help='torch.jit.script the full model')
 scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None, const='inductor',
                              help="Enable compilation w/ specified backend (default: inductor).")
 
-# Device & distributed
+# Device and distributed training
 group = parser.add_argument_group('Device parameters')
 group.add_argument('--device', default='cuda', type=str,
                     help="Device (accelerator) to use.")
@@ -338,7 +335,7 @@ group.add_argument('--drop-path', type=float, default=None, metavar='PCT',
 group.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                    help='Drop block rate (default: None)')
 
-# Batch norm parameters (only works with gen_efficientnet based models currently)
+# Batch normalization options for compatible models
 group = parser.add_argument_group('Batch norm parameters', 'Only works with gen_efficientnet based models currently.')
 group.add_argument('--bn-momentum', type=float, default=None,
                    help='BatchNorm momentum override (if not None)')
@@ -351,7 +348,7 @@ group.add_argument('--dist-bn', type=str, default='reduce',
 group.add_argument('--split-bn', action='store_true',
                    help='Enable separate BN layers per augmentation split.')
 
-# Model Exponential Moving Average
+# Exponential moving average of model weights
 group = parser.add_argument_group('Model exponential moving average parameters')
 group.add_argument('--model-ema', action='store_true', default=False,
                    help='Enable tracking moving average of model weights.')
@@ -403,18 +400,17 @@ group.add_argument('--wandb-resume-id', default='', type=str, metavar='ID',
 
 
 def _parse_args():
-    # Do we have a config file to parse?
+    # Read optional YAML configuration defaults.
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
         with open(args_config.config, 'r') as f:
             cfg = yaml.safe_load(f)
             parser.set_defaults(**cfg)
 
-    # The main arg parser parses the rest of the args, the usual
-    # defaults will have been overridden if config file specified.
+    # Explicit command-line options take precedence over YAML defaults.
     args = parser.parse_args(remaining)
 
-    # Cache the args as a text string to save them in the output dir later
+    # Serialize the effective configuration for the run directory.
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
@@ -479,10 +475,10 @@ def main():
 
     factory_kwargs = {}
     if args.pretrained_path:
-        # merge with pretrained_cfg of model, 'file' has priority over 'url' and 'hf_hub'.
+        # Use the supplied file in preference to the registry URL or Hub identifier.
         factory_kwargs['pretrained_cfg_overlay'] = dict(
             file=args.pretrained_path,
-            num_classes=-1,  # force head adaptation
+            num_classes=-1,  # Reinitialize the checkpoint classification head.
         )
 
     model = create_model(
@@ -510,7 +506,7 @@ def main():
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
-        args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
+        args.num_classes = model.num_classes
 
     if args.grad_checkpointing:
         model.set_grad_checkpointing(enable=True)
@@ -521,19 +517,19 @@ def main():
 
     data_config = resolve_data_config(vars(args), model=model, verbose=utils.is_primary(args))
 
-    # setup augmentation batch splits for contrastive loss or split bn
+    # Set the number of augmentation splits used by JSD loss or split BatchNorm.
     num_aug_splits = 0
     if args.aug_splits > 0:
         assert args.aug_splits > 1, 'A split of 1 makes no sense'
         num_aug_splits = args.aug_splits
 
-    # enable split bn (separate bn stats per batch-portion)
+    # Track separate BatchNorm statistics for each augmentation split.
     if args.split_bn:
         assert num_aug_splits > 1 or args.resplit
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
-    # move model to GPU, enable channels last layout if set
-    model.to(device=device, dtype=model_dtype)  # FIXME move model device & dtype into create_model
+    # Move the model to the selected device and optionally use channels-last layout.
+    model.to(device=device, dtype=model_dtype)
     if args.channels_last:
         model.to(memory_format=torch.channels_last)
 
@@ -543,7 +539,7 @@ def main():
         assert not args.split_bn
         if has_apex and use_amp == 'apex':
             # Apex SyncBN used with Apex AMP
-            # WARNING this won't currently work with models using BatchNormAct2d
+            # Apex SyncBatchNorm does not support models using BatchNormAct2d.
             model = convert_syncbn_model(model)
         else:
             model = convert_sync_batchnorm(model)
@@ -579,14 +575,14 @@ def main():
     )
     if utils.is_primary(args):
         defaults = copy.deepcopy(optimizer.defaults)
-        defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
+        defaults['weight_decay'] = args.weight_decay  # Report the configured weight decay in the optimizer log.
         defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
         logging.info(
             f'Created {type(optimizer).__name__} ({args.opt}) optimizer: {defaults}'
         )
 
-    # setup automatic mixed-precision (AMP) loss scaling and op casting
-    amp_autocast = suppress  # do nothing
+    # Select the autocast context and gradient scaler for the active precision mode.
+    amp_autocast = suppress  # Defaults to a no-op context when autocast is disabled.
     loss_scaler = None
     if use_amp == 'apex':
         assert device.type == 'cuda'
@@ -597,7 +593,7 @@ def main():
     elif use_amp == 'native':
         amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
         if device.type in ('cuda',) and amp_dtype == torch.float16:
-            # loss scaler only used for float16 (half) dtype, bfloat16 does not need it
+            # Use gradient scaling for CUDA float16.
             loss_scaler = NativeScaler(device=device.type)
         if utils.is_primary(args):
             _logger.info('Using native Torch AMP. Training in mixed precision.')
@@ -616,10 +612,10 @@ def main():
             log_info=utils.is_primary(args),
         )
 
-    # setup exponential moving average of model weights, SWA could be used here too
+    # Initialize and optionally restore the exponential moving average of model weights.
     model_ema = None
     if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before DDP wrapper
+        # Initialize the EMA after device and AMP setup, before DDP wrapping.
         model_ema = utils.ModelEmaV3(
             model,
             decay=args.model_ema_decay,
@@ -634,7 +630,7 @@ def main():
     # setup distributed training
     if args.distributed:
         if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
+            # Use Apex DDP when Apex is available and native AMP is inactive.
             if utils.is_primary(args):
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
             model = ApexDDP(model, delay_allreduce=True)
@@ -706,7 +702,7 @@ def main():
             num_classes=args.num_classes
         )
         if args.prefetcher:
-            assert not num_aug_splits  # collate conflict (need to support de-interleaving in collate mixup)
+            assert not num_aug_splits  # FastCollateMixup cannot collate the interleaved augmentation splits.
             collate_fn = FastCollateMixup(**mixup_args)
         else:
             mixup_fn = Mixup(**mixup_args)
@@ -760,7 +756,7 @@ def main():
     if args.val_split:
         eval_workers = args.workers
         if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
-            # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
+            # Limit validation workers to reduce padding when using distributed TFDS or WebDataset.
             eval_workers = min(2, args.workers)
         loader_eval = create_loader(
             dataset_eval,
@@ -782,10 +778,10 @@ def main():
 
     # setup loss function
     if args.jsd_loss:
-        assert num_aug_splits > 1  # JSD only valid with aug splits set
+        assert num_aug_splits > 1  # JSD compares predictions across augmentation splits.
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
     elif mixup_active:
-        # smoothing is handled with mixup target transform which outputs sparse, soft targets
+        # Mixup applies label smoothing when it constructs the soft targets.
         if args.bce_loss:
             train_loss_fn = BinaryCrossEntropy(
                 target_threshold=args.bce_target_thresh,
@@ -865,7 +861,7 @@ def main():
     )
     start_epoch = 0
     if args.start_epoch is not None:
-        # a specified start_epoch will always override the resume epoch
+        # An explicit start epoch takes precedence over the checkpoint epoch.
         start_epoch = args.start_epoch
     elif resume_epoch is not None:
         start_epoch = resume_epoch
@@ -962,11 +958,11 @@ def main():
                 latest_metric = train_metrics[eval_metric]
 
             if saver is not None:
-                # save proper checkpoint with eval metric
+                # Save a checkpoint ranked by the selected evaluation metric.
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=latest_metric)
 
             if lr_scheduler is not None:
-                # step LR for next epoch
+                # Advance the learning-rate schedule for the next epoch.
                 lr_scheduler.step(epoch + 1, latest_metric)
 
             latest_results = {
@@ -985,7 +981,7 @@ def main():
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
     if utils.is_primary(args):
-        # for parsable results display, dump top-10 summaries to avoid excess console spam
+        # Write the ten best epoch summaries in JSON for downstream tools.
         display_results = sorted(
             results,
             key=lambda x: x.get('validation', x.get('train')).get(eval_metric, 0),
@@ -1050,7 +1046,7 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        # multiply by accum steps to get equivalent for full update
+        # Estimate data preparation time per optimizer update from the current batch.
         data_time_m.update(accum_steps * (time.time() - data_start_time))
 
         def _forward():
@@ -1103,6 +1099,7 @@ def train_one_epoch(
         if model_ema is not None:
             model_ema.update(model, step=num_updates)
 
+        # Optional synchronization includes completed accelerator work in step timing.
         if args.synchronize_step:
             if device.type == 'cuda':
                 torch.cuda.synchronize()
@@ -1118,7 +1115,7 @@ def train_one_epoch(
 
             loss_avg, loss_now = losses_m.avg, losses_m.val
             if args.distributed:
-                # synchronize current step and avg loss, each process keeps its own running avg
+                # Average the current and running loss across distributed workers for logging.
                 loss_avg = utils.reduce_tensor(loss.new([loss_avg]), args.world_size).item()
                 loss_now = utils.reduce_tensor(loss.new([loss_now]), args.world_size).item()
                 update_sample_count *= args.world_size
@@ -1151,14 +1148,13 @@ def train_one_epoch(
 
         update_sample_count = 0
         data_start_time = time.time()
-        # end for
-
+    
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
     loss_avg = losses_m.avg
     if args.distributed:
-        # synchronize avg loss, each process keeps its own running avg
+        # Reduce each worker's epoch loss to a global average.
         loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
         loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
     return OrderedDict([('loss', loss_avg)])
@@ -1197,7 +1193,7 @@ def validate(
                 if isinstance(output, (tuple, list)):
                     output = output[0]
 
-                # augmentation reduction
+                # Average the logits for each group of test-time augmentations.
                 reduce_factor = args.tta
                 if reduce_factor > 1:
                     output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)

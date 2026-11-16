@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-""" ImageNet Validation Script
+"""Evaluate a closed-set PlanktonNet classification checkpoint.
 
-This is intended to be a lean and easily modifiable ImageNet validation script for evaluating pretrained
-models or training checkpoints against ImageNet or similarly organized image datasets. It prioritizes
-canonical PyTorch, standard Python style, and good performance. Repurpose as you see fit.
+Reports loss and top-1 and top-5 accuracy on the selected split. Use
+--metrics-avg to also report precision, recall, and F1.
 
-Hacked together by Ross Wightman (https://github.com/rwightman)
+Original validation script by Ross Wightman (https://github.com/rwightman).
 """
 import argparse
 import csv
@@ -28,7 +27,7 @@ from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
 
-from closed_set_backbone import PlanktonNet_Le as PlanktonNet
+from PlanktonNet import PlanktonNet_Le as PlanktonNet
 
 
 
@@ -181,7 +180,7 @@ parser.add_argument('--naflex-max-seq-len', type=int, default=576,
 
 
 def validate(args):
-    # might as well try to validate something
+    # Request pretrained weights if no checkpoint was supplied.
     args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
 
@@ -201,7 +200,7 @@ def validate(args):
         assert args.model_dtype in ('float32', 'float16', 'bfloat16')
         model_dtype = getattr(torch, args.model_dtype)
 
-    # resolve AMP arguments based on PyTorch / Apex availability
+    # Select the mixed-precision implementation supported by the runtime.
     use_amp = None
     amp_autocast = suppress
     if args.amp:
@@ -265,7 +264,7 @@ def validate(args):
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
 
-    model = model.to(device=device, dtype=model_dtype)  # FIXME move model device & dtype into create_model
+    model = model.to(device=device, dtype=model_dtype)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
@@ -322,7 +321,7 @@ def validate(args):
     if args.naflex_loader:
         model_patch_size = None
         if hasattr(model, 'embeds') and hasattr(model.embeds, 'patch_size'):
-            # NaFlexVit models have embeds.patch_size
+            # Prefer the patch size declared by the model.
             model_patch_size = model.embeds.patch_size
         from timm.data  import create_naflex_loader
         loader = create_naflex_loader(
@@ -374,7 +373,7 @@ def validate(args):
 
     model.eval()
     with torch.inference_mode():
-        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
+        # Run an untimed warm-up forward pass for fixed-resolution inputs.
         if not args.naflex_loader:
             input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device=device, dtype=model_dtype)
             if args.channels_last:
@@ -413,7 +412,7 @@ def validate(args):
                 all_preds.append(predictions.cpu())
                 all_targets.append(target.cpu())
 
-            # measure elapsed time
+            # Record elapsed batch time, including data loading and metric calculation.
             batch_time.update(time.time() - end)
             end = time.time()
 
@@ -435,7 +434,7 @@ def validate(args):
                 )
 
     if real_labels is not None:
-        # real labels mode replaces topk values at the end
+        # Use the alternative label annotations when computing final top-k accuracy.
         top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
     else:
         top1a, top5a = top1.avg, top5.avg
@@ -484,7 +483,7 @@ def _try_run(args, initial_batch_size):
     results = OrderedDict()
     error_str = 'Unknown'
     while batch_size:
-        args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
+        args.batch_size = batch_size * args.num_gpu  # Convert the per-device batch size to the total batch size.
         try:
             if 'cuda' in args.device and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -515,14 +514,14 @@ def main():
     model_cfgs = []
     model_names = []
     if os.path.isdir(args.checkpoint):
-        # validate all checkpoints in a path with same model
+        # Evaluate each checkpoint in the directory with the same model.
         checkpoints = glob.glob(args.checkpoint + '/*.pth.tar')
         checkpoints += glob.glob(args.checkpoint + '/*.pth')
         model_names = list_models(model_name)
         model_cfgs = [(model_name, c) for c in sorted(checkpoints, key=natural_key)]
     else:
         if args.model == 'all':
-            # validate all models in a list of names with pretrained checkpoints
+            # Evaluate each selected model using its registry-provided weights.
             args.pretrained = True
             model_names = list_models(
                 pretrained=True,
@@ -530,7 +529,7 @@ def main():
             )
             model_cfgs = [(n, '') for n in model_names]
         elif not is_model(model_name):
-            # model name doesn't exist, try as wildcard filter
+            # Interpret an unregistered model name as a wildcard pattern.
             model_names = list_models(
                 model_name, pretrained=True,
             )
@@ -567,7 +566,7 @@ def main():
     if args.results_file:
         write_results(args.results_file, results, format=args.results_format)
 
-    # output results in JSON to stdout w/ delimiter for runner script
+    # Print JSON after a delimiter so a calling script can parse the results.
     print(f'--result\n{json.dumps(results, indent=4)}')
 
 

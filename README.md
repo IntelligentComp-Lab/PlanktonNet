@@ -33,7 +33,7 @@ Extract the open-set and ZooCAMNet76 archives at the repository root. For the ot
 
 ## PlanktonNet classification
 
-`closed_set_backbone.py` contains the PlanktonNet classifier. Set `--num-classes` to the class count of the selected benchmark.
+`PlanktonNet.py` contains the closed-set classifier. Set `--num-classes` to the class count of the selected benchmark.
 
 Train on the labeled training split.
 
@@ -49,7 +49,7 @@ python validate_github.py --data-dir data/ZooplanktonBench50 --split test --mode
 
 ## PlanktonNet + CAC
 
-`PlanktonNet.py` supplies the backbone features for open-set recognition. Train with cross-entropy and the CAC anchor loss.
+`planktonnet_features.py` supplies the backbone features for open-set recognition. Train with cross-entropy and the CAC anchor loss.
 
 ```sh
 python train_cac.py --data-dir data --dataset ZooplanktonBench50_OpenSet --workers 0 --device cuda:0

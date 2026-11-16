@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate CAC + PlanktonNet with training class means and Euclidean distance."""
+"""Evaluate CAC-trained PlanktonNet using distances to training class centers."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ ARCHIVED_CHECKPOINT_SHA256 = "ff076aa7d9344cc5926f7696fa008123fa6024348dfeb21d34
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--backbone-source", type=Path, default=REVISION_ROOT / "PlanktonNet.py")
+    p.add_argument("--backbone-source", type=Path, default=REVISION_ROOT / "planktonnet_features.py")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--data-dir", type=Path, default=REVISION_ROOT / "data")
     p.add_argument("--dataset", default="ZooplanktonBench50_OpenSet")
@@ -59,6 +59,7 @@ def main():
     check_unknown_classes(class_map, validation_unknown_data, test_unknown_data)
 
     model = load_model(args.checkpoint, args.backbone_source, device)
+    # Average known training embeddings to obtain one center per class.
     train_features, train_targets = extract_features(model, train_loader, device, "train centers")
     class_ids, centers = training_class_centers(train_features, train_targets)
 
@@ -66,9 +67,11 @@ def main():
     vu, _ = extract_features(model, validation_unknown, device, args.val_unknown_split)
     vks, vpred = calculate(vk, centers, class_ids)
     vus, _ = calculate(vu, centers, class_ids)
+    # Maximize open-set F1 across the observed scores from both validation splits.
     selected = metrics_for_validation(vks, vpred, vt.numpy(), vus, n_steps=None)
     threshold = float(selected["best_threshold"])
 
+    # Use the same training centers and validation threshold for both test splits.
     tk, tt = extract_features(model, test, device, "test_know")
     tu, _ = extract_features(model, test_unknown, device, "test_unknow")
     tks, tpred = calculate(tk, centers, class_ids)

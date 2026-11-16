@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Train PlanktonNet on known classes with the paper's CAC objective."""
+
 import argparse
 import time
 import logging
@@ -12,8 +14,7 @@ from timm.data import create_dataset, create_loader, resolve_data_config
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 
-# === Import Custom Modules ===
-from PlanktonNet import PlanktonNet
+from planktonnet_features import PlanktonNet
 from cacUtils import CACModel, PaperCACLoss
 
 _logger = logging.getLogger('train_cac')
@@ -29,7 +30,7 @@ def add_file_handler(logger, log_file):
 def parse_args():
     parser = argparse.ArgumentParser(description='Train PlanktonNet with CAC')
 
-    # Path Arguments
+    # Dataset paths, output, and runtime settings.
     parser.add_argument('--data-dir', metavar='DIR', required=True)
     parser.add_argument('--dataset', default='ZooplanktonBench50_OpenSet')
     parser.add_argument('--output', default='./output/train_cac', type=str)
@@ -38,20 +39,20 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda', type=str)
 
-    # Model & CAC Arguments
+    # Backbone projection and CAC loss settings.
     parser.add_argument('--model', default='plankton_net', choices=('plankton_net',))
     parser.add_argument('--num-classes', type=int, default=50)
     parser.add_argument('--feature-dim', default=448, type=int)
     parser.add_argument('--cac-magnitude', default=10.0, type=float, help='Anchor magnitude')
     parser.add_argument('--cac-scale', default=0.1, type=float, help='Anchor loss weight')
 
-    # Training Arguments
+    # Training schedule.
     parser.add_argument('--batch-size', type=int, default=26)
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--start-epoch', type=int, default=None)
     parser.add_argument('--log-interval', type=int, default=50)
 
-    # Optimizer
+    # Optimizer and gradient clipping.
     parser.add_argument('--opt', type=str, default='adamw')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=5e-4)
@@ -61,7 +62,7 @@ def parse_args():
     parser.add_argument('--clip-grad', type=float, default=None)
     parser.add_argument('--clip-mode', type=str, default='norm')
 
-    # Scheduler
+    # Learning-rate scheduler.
     parser.add_argument('--sched', default='cosine', type=str)
     parser.add_argument('--min-lr', type=float, default=1e-4)
     parser.add_argument('--warmup-lr', type=float, default=1e-4)
@@ -71,7 +72,7 @@ def parse_args():
     parser.add_argument('--decay-rate', type=float, default=0.1)
     parser.add_argument('--patience-epochs', type=int, default=10)
 
-    # Data & Augmentation Arguments (Fixed Missing Args)
+    # Dataset splits and input loading.
     parser.add_argument('--train-split', default='train')
     parser.add_argument('--val-split', default='validation')
     parser.add_argument('--no-prefetcher', action='store_true')
@@ -79,7 +80,7 @@ def parse_args():
     parser.add_argument('--input-img-mode', default='RGB')
     parser.add_argument('--train-interpolation', default='bicubic')
 
-    # Added missing arguments causing errors
+    # Input sizing, regularization, and image augmentation.
     parser.add_argument('--img-size', type=int, default=224)
     parser.add_argument('--drop', type=float, default=0.0)
     parser.add_argument('--drop-path', type=float, default=0.0)
@@ -89,7 +90,7 @@ def parse_args():
     parser.add_argument('--recount', type=int, default=1)
     parser.add_argument('--resplit', action='store_true')
 
-    # Mixup args (Disabled for CAC but kept for compatibility)
+    # Keep these CLI options for compatibility. CAC requires hard labels.
     parser.add_argument('--mixup', type=float, default=0.0)
     parser.add_argument('--cutmix', type=float, default=0.0)
     parser.add_argument('--mixup-prob', type=float, default=1.0)
@@ -97,6 +98,7 @@ def parse_args():
     parser.add_argument('--mixup-mode', type=str, default='batch')
     parser.add_argument('--smoothing', type=float, default=0.0)
 
+    # Random crop and color augmentation.
     parser.add_argument('--scale', type=float, nargs='+', default=[0.08, 1.0])
     parser.add_argument('--ratio', type=float, nargs='+', default=[3. / 4., 4. / 3.])
     parser.add_argument('--hflip', type=float, default=0.5)
@@ -105,7 +107,7 @@ def parse_args():
     parser.add_argument('--aug-repeats', type=float, default=0)
     parser.add_argument('--aug-splits', type=int, default=0)
 
-    # Checkpoint & Amp & Distributed
+    # Checkpointing, mixed precision, and distributed options.
     parser.add_argument('--resume', default='')
     parser.add_argument('--no-resume-opt', action='store_true')
     parser.add_argument('--checkpoint-hist', type=int, default=5)
@@ -127,7 +129,6 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     utils.random_seed(args.seed)
 
-    # 1. Output setup
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp_name = args.experiment or 'cac_paper'
     final_output_dir = os.path.join(args.output, f"{timestamp}_{exp_name}")
@@ -137,7 +138,6 @@ def main():
     _logger.info(f"Dataset Root: {args.data_dir}")
     _logger.info(f"Output Directory: {final_output_dir}")
 
-    # 2. Model
     _logger.info(f"Creating PlanktonNet (Backbone)...")
     backbone = PlanktonNet(pretrained=False, drop_rate=args.drop, drop_path_rate=args.drop_path)
 
@@ -145,11 +145,9 @@ def main():
     model = CACModel(backbone, feature_dim=args.feature_dim, num_classes=args.num_classes)
     model.to(device)
 
-    # 3. Loss & Opt
     loss_fn = PaperCACLoss(args.num_classes, args.cac_magnitude, args.cac_scale).to(device)
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
-    # AMP
     amp_autocast = suppress
     loss_scaler = None
     if args.amp:
@@ -158,9 +156,8 @@ def main():
         amp_autocast = autocast
         loss_scaler = NativeScaler()
 
-    # 4. Data Loading
     data_config = resolve_data_config(vars(args), model=model, verbose=True)
-    # Force input size from args
+    # Set the RGB input size explicitly from the command line.
     data_config['input_size'] = (3, args.img_size, args.img_size)
 
     train_path = os.path.join(args.data_dir, args.dataset, args.train_split)
@@ -194,7 +191,7 @@ def main():
         device=device
     )
 
-    # Align class map
+    # Use the training class indices for known validation images.
     class_map = dataset_train.reader.class_to_idx if hasattr(dataset_train, 'reader') else dataset_train.class_to_idx
 
     dataset_eval = create_dataset(name='', root=val_path, split='', is_training=False, batch_size=args.batch_size,
@@ -211,24 +208,20 @@ def main():
         device=device
     )
 
-    # 5. Scheduler
     lr_scheduler, _ = create_scheduler_v2(optimizer, **scheduler_kwargs(args), updates_per_epoch=len(loader_train))
 
-    # 6. Saver
     saver = utils.CheckpointSaver(
         model=model, optimizer=optimizer, args=args,
         checkpoint_dir=final_output_dir, recovery_dir=final_output_dir,
         max_history=args.checkpoint_hist, decreasing=False
     )
 
-    # 7. Loop
     _logger.info(f"Start CAC training ({args.epochs} epochs).")
     total_start_time = time.time()
 
     for epoch in range(args.start_epoch or 0, args.epochs):
         ep_start = time.time()
 
-        # Train
         model.train()
         avg_loss = utils.AverageMeter()
         avg_anchor = utils.AverageMeter()
@@ -237,7 +230,7 @@ def main():
             input, target = input.to(device), target.to(device)
 
             with amp_autocast():
-                output = model(input)  # (B, num_classes)
+                output = model(input)
                 loss, anchor_loss = loss_fn(output, target)
 
             optimizer.zero_grad()
@@ -255,7 +248,7 @@ def main():
 
             if lr_scheduler: lr_scheduler.step_update(epoch * len(loader_train) + batch_idx)
 
-        # Validate
+        # Measure top-1 accuracy on known validation classes for checkpoint selection.
         model.eval()
         top1 = utils.AverageMeter()
         val_loss_m = utils.AverageMeter()
@@ -268,16 +261,13 @@ def main():
                 prediction = output.argmax(dim=1)
                 acc = (prediction == target).sum() / input.size(0)
 
-                # Validation Loss
                 v_loss, _ = loss_fn(output, target)
 
                 top1.update(acc.item() * 100, input.size(0))
                 val_loss_m.update(v_loss.item(), input.size(0))
 
-        # Save
         saver.save_checkpoint(epoch, metric=top1.avg)
 
-        # Log
         lrl = [param_group['lr'] for param_group in optimizer.param_groups]
         lr = sum(lrl) / len(lrl)
         duration = time.time() - ep_start
